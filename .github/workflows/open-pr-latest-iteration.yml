@@ -47,7 +47,7 @@ jobs:
 
           BASE_BRANCH: ${{ inputs.base_branch || 'main' }}
           PREFIX: ${{ inputs.prefix || 'Pre-Release-Iteration-' }}
-          ASSIGNEE: ${{ inputs.assignee || 'PUT_GITHUB_USERNAME_HERE' }}
+          ASSIGNEE: ${{ inputs.assignee || 'enzo-z' }}
           REVIEWER: ${{ inputs.reviewer || '' }}
         run: |
           python3 - <<'PY'
