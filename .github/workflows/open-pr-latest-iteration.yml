@@ -1,0 +1,175 @@
+name: Open PR from latest Pre-Release Iteration to main (every 15 min)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: "Base branch to merge into (default is main)"
+        required: false
+        default: "main"
+        type: string
+      prefix:
+        description: "Iteration branch prefix"
+        required: false
+        default: "Pre-Release-Iteration-"
+        type: string
+      assignee:
+        description: "GitHub username to assign the PR to"
+        required: true
+        default: "enzo-z"
+        type: string
+      reviewer:
+        description: "Optional GitHub username to request review from"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: open-pr-latest-iteration
+  cancel-in-progress: false
+
+jobs:
+  open_pr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create/ensure PR for latest iteration branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+
+          BASE_BRANCH: ${{ inputs.base_branch || 'main' }}
+          PREFIX: ${{ inputs.prefix || 'Pre-Release-Iteration-' }}
+          ASSIGNEE: ${{ inputs.assignee || 'PUT_GITHUB_USERNAME_HERE' }}
+          REVIEWER: ${{ inputs.reviewer || '' }}
+        run: |
+          python3 - <<'PY'
+          import os, re, json
+          import urllib.request, urllib.parse
+
+          token = os.environ["GH_TOKEN"]
+          api_url = os.environ["API_URL"].rstrip("/")
+          repo = os.environ["REPO"]
+          base_branch = os.environ["BASE_BRANCH"]
+          prefix = os.environ["PREFIX"]
+          assignee = os.environ["ASSIGNEE"].strip()
+          reviewer = os.environ["REVIEWER"].strip()
+
+          if not assignee or assignee == "PUT_GITHUB_USERNAME_HERE":
+            raise SystemExit("Please set ASSIGNEE (either via workflow_dispatch input or by editing the YAML default).")
+
+          owner, name = repo.split("/", 1)
+          base = f"{api_url}/repos/{owner}/{name}"
+
+          def api_request(method, url, payload=None):
+            data = None
+            headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "open-latest-iteration-pr-workflow"
+            }
+            if payload is not None:
+              data = json.dumps(payload).encode("utf-8")
+              headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            try:
+              with urllib.request.urlopen(req) as resp:
+                body = resp.read().decode("utf-8")
+                return resp.status, json.loads(body) if body else None
+            except urllib.error.HTTPError as e:
+              body = e.read().decode("utf-8") if e.fp else ""
+              try:
+                parsed = json.loads(body) if body else {"message": str(e)}
+              except Exception:
+                parsed = {"message": body or str(e)}
+              return e.code, parsed
+
+          # 1) Find latest iteration branch (highest number)
+          pattern = re.compile(rf"^{re.escape(prefix)}(\d+)$")
+          max_n = 0
+          latest_branch = None
+          page = 1
+
+          while True:
+            url = f"{base}/branches?per_page=100&page={page}"
+            status, branches = api_request("GET", url)
+            if status != 200:
+              raise SystemExit(f"Failed to list branches: HTTP {status} {branches}")
+
+            if not branches:
+              break
+
+            for b in branches:
+              bn = b.get("name", "")
+              m = pattern.match(bn)
+              if m:
+                n = int(m.group(1))
+                if n > max_n:
+                  max_n = n
+                  latest_branch = bn
+
+            page += 1
+
+          if not latest_branch:
+            print(f"No branches found matching {prefix}<number>. Nothing to do.")
+            raise SystemExit(0)
+
+          print(f"Latest iteration branch: {latest_branch}")
+
+          # 2) Check if an open PR already exists from latest_branch -> base_branch
+          # Use the pulls list endpoint filtered by head/base.
+          head = urllib.parse.quote(f"{owner}:{latest_branch}", safe="")
+          base_q = urllib.parse.quote(base_branch, safe="")
+          pulls_url = f"{base}/pulls?state=open&head={head}&base={base_q}"
+          status, pulls = api_request("GET", pulls_url)
+          if status != 200:
+            raise SystemExit(f"Failed to query existing PRs: HTTP {status} {pulls}")
+
+          if pulls and isinstance(pulls, list) and len(pulls) > 0:
+            pr = pulls[0]
+            print(f"PR already exists: #{pr.get('number')} {pr.get('html_url')}")
+            raise SystemExit(0)
+
+          # 3) Create the PR
+          create_pr_url = f"{base}/pulls"
+          payload = {
+            "title": f"Merge {latest_branch} -> {base_branch}",
+            "head": latest_branch,
+            "base": base_branch,
+            "body": (
+              f"Automated PR created by GitHub Actions.\n\n"
+              f"Source: `{latest_branch}`\n"
+              f"Target: `{base_branch}`\n"
+            ),
+            "maintainer_can_modify": True
+          }
+          status, pr = api_request("POST", create_pr_url, payload)
+          if status not in (200, 201):
+            raise SystemExit(f"Failed to create PR: HTTP {status} {pr}")
+
+          pr_number = pr["number"]
+          print(f"Created PR #{pr_number}: {pr.get('html_url')}")
+
+          # 4) Assign a user (assignee)
+          issue_url = f"{base}/issues/{pr_number}"
+          status, resp = api_request("PATCH", issue_url, {"assignees": [assignee]})
+          if status not in (200, 201):
+            raise SystemExit(f"Failed to assign PR: HTTP {status} {resp}")
+          print(f"Assigned PR to: {assignee}")
+
+          # 5) Optionally request a reviewer
+          if reviewer:
+            reviewers_url = f"{base}/pulls/{pr_number}/requested_reviewers"
+            status, resp = api_request("POST", reviewers_url, {"reviewers": [reviewer]})
+            if status not in (200, 201):
+              raise SystemExit(f"Failed to request reviewer: HTTP {status} {resp}")
+            print(f"Requested review from: {reviewer}")
+          PY
