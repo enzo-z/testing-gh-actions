@@ -1,9 +1,9 @@
-name: Create Pre-Release Iteration Branch (every 5 min)
+name: Create Pre-Release Iteration Branch (every 10 min)
 
 on:
-  # For testing: runs every 5 minutes (UTC-based) nice
+  # For testing: runs every 10 minutes (UTC-based) nice
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
 
   # Manual trigger for quick testing
   workflow_dispatch:
