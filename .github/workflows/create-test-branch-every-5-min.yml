@@ -1,7 +1,7 @@
 name: Create Pre-Release Iteration Branch (every 5 min)
 
 on:
-  # For testing: runs every 5 minutes (UTC-based)
+  # For testing: runs every 5 minutes (UTC-based) nice
   schedule:
     - cron: "*/5 * * * *"
 
