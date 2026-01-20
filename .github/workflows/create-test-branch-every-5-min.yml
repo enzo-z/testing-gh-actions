@@ -1,0 +1,133 @@
+name: Create Pre-Release Iteration Branch (every 5 min)
+
+on:
+  # For testing: runs every 5 minutes (UTC-based)
+  schedule:
+    - cron: "*/5 * * * *"
+
+  # Manual trigger for quick testing
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: "Branch to branch off from (e.g., main / Release-Non-Prod)"
+        required: false
+        default: "main"
+        type: string
+      prefix:
+        description: "Prefix for iteration branches"
+        required: false
+        default: "Pre-Release-Iteration-"
+        type: string
+
+permissions:
+  contents: write # required to create a new git ref (branch)
+
+concurrency:
+  group: create-pre-release-iteration-branch-5min
+  cancel-in-progress: false
+
+jobs:
+  create_branch:
+    name: Create next iteration branch
+    runs-on: ubuntu-latest
+    # If GHES doesn't provide hosted runners, use:
+    # runs-on: [self-hosted, linux]
+
+    steps:
+      - name: Create next iteration branch (incrementing)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+          BASE_BRANCH: ${{ inputs.base_branch || 'main' }}
+          PREFIX: ${{ inputs.prefix || 'Pre-Release-Iteration-' }}
+        run: |
+          python3 - <<'PY'
+          import os, re, json
+          import urllib.request
+          import urllib.parse
+
+          token = os.environ["GH_TOKEN"]
+          api_url = os.environ["API_URL"].rstrip("/")
+          repo = os.environ["REPO"]
+          base_branch = os.environ["BASE_BRANCH"]
+          prefix = os.environ["PREFIX"]
+
+          owner, name = repo.split("/", 1)
+          base = f"{api_url}/repos/{owner}/{name}"
+
+          def api_request(method, url, payload=None):
+            data = None
+            headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "create-iteration-branch-workflow"
+            }
+            if payload is not None:
+              data = json.dumps(payload).encode("utf-8")
+              headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            try:
+              with urllib.request.urlopen(req) as resp:
+                body = resp.read().decode("utf-8")
+                return resp.status, json.loads(body) if body else None
+            except urllib.error.HTTPError as e:
+              body = e.read().decode("utf-8") if e.fp else ""
+              try:
+                parsed = json.loads(body) if body else {"message": str(e)}
+              except Exception:
+                parsed = {"message": body or str(e)}
+              return e.code, parsed
+
+          # 1) Read base branch HEAD SHA
+          encoded = urllib.parse.quote(base_branch, safe="")
+          ref_url = f"{base}/git/ref/heads/{encoded}"
+          status, ref_data = api_request("GET", ref_url)
+          if status != 200:
+            raise SystemExit(f"Failed to read base branch '{base_branch}': HTTP {status} {ref_data}")
+
+          base_sha = ref_data["object"]["sha"]
+          print(f"Base branch '{base_branch}' SHA: {base_sha}")
+
+          # 2) List branches and find max iteration number
+          max_n = 0
+          page = 1
+          pattern = re.compile(rf"^{re.escape(prefix)}(\d+)$")
+
+          while True:
+            branches_url = f"{base}/branches?per_page=100&page={page}"
+            status, branches = api_request("GET", branches_url)
+            if status != 200:
+              raise SystemExit(f"Failed to list branches: HTTP {status} {branches}")
+
+            if not branches:
+              break
+
+            for b in branches:
+              bn = b.get("name", "")
+              m = pattern.match(bn)
+              if m:
+                n = int(m.group(1))
+                if n > max_n:
+                  max_n = n
+
+            page += 1
+
+          next_n = max_n + 1
+          new_branch = f"{prefix}{next_n}"
+          print(f"Creating next iteration branch: {new_branch}")
+
+          # 3) Create the new branch ref
+          create_url = f"{base}/git/refs"
+          payload = {"ref": f"refs/heads/{new_branch}", "sha": base_sha}
+          status, resp = api_request("POST", create_url, payload)
+
+          if status in (200, 201):
+            print(f"Created branch: {new_branch}")
+          elif status == 422:
+            # In case of a race (two runs) or name collision, do not fail the workflow
+            print(f"Branch not created (422 - already exists or validation): {resp}")
+          else:
+            raise SystemExit(f"Failed to create branch: HTTP {status} {resp}")
+          PY
