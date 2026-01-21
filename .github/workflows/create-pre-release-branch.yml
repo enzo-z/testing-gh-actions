@@ -101,19 +101,19 @@ jobs:
               raw = base64.b64decode(content_b64).decode("utf-8")
               obj = json.loads(raw)
 
-              # New format: currentIterationNumber means "last created"
-              current = int(obj.get("currentIterationNumber", 0))
-              return current, sha
+              # New format: nextIterationNumber means "the next number to create"
+              nxt = int(obj.get("nextIterationNumber", 1))
+              return nxt, sha
 
             if status == 404:
-              # Initialize as "nothing created yet"
-              return 0, None
+              # Initialize counter file with nextIterationNumber=1
+              return 1, None
 
             raise SystemExit(f"Failed to read counter file: HTTP {status} {data}")
 
-          def write_counter(current_value, existing_sha):
-            message = f"chore(release): set currentIterationNumber to {current_value} [skip ci]"
-            body = json.dumps({"currentIterationNumber": current_value}, indent=2) + "\n"
+          def write_counter(next_value, existing_sha):
+            message = f"chore(release): set nextIterationNumber to {next_value} [skip ci]"
+            body = json.dumps({"nextIterationNumber": next_value}, indent=2) + "\n"
             payload = {
               "message": message,
               "content": base64.b64encode(body.encode("utf-8")).decode("utf-8"),
@@ -129,11 +129,10 @@ jobs:
             return data
 
           # 1) Determine next iteration number (monotonic increasing)
-          current_n, counter_sha = get_or_init_counter()
-          next_n = current_n + 1
+          next_n, counter_sha = get_or_init_counter()
           new_branch = f"{prefix}{next_n}"
 
-          print(f"Current iteration number from counter: {current_n}")
+          print(f"Next iteration number from counter: {next_n}")
           print(f"Creating next iteration branch: {new_branch}")
 
           # 2) Create the branch ref from BASE_BRANCH HEAD
@@ -151,7 +150,7 @@ jobs:
 
           print(f"Created branch: {new_branch}")
 
-          # 3) Update the counter file to the newly created iteration number
-          write_counter(next_n, counter_sha)
-          print(f"Counter updated to {next_n} in {counter_path}")
+          # 3) Bump the counter file so we never reuse numbers
+          write_counter(next_n + 1, counter_sha)
+          print(f"Counter updated to nextIterationNumber={next_n + 1} in {counter_path}")
           PY
