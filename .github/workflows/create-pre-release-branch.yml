@@ -1,8 +1,11 @@
-name: Create Pre-Release Iteration Branch (monotonic, every 10 min)
+name: Create Pre-Release Iteration Branch (monotonic, biweekly)
 
 on:
+  # GitHub Actions cron is evaluated in UTC.
+  # This is Mondays 05:01 UTC (~00:01 EST during standard time).
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "1 5 * * 1"
+
   workflow_dispatch:
     inputs:
       base_branch:
@@ -19,6 +22,11 @@ on:
         description: "Path to counter file in repo"
         required: false
         default: ".release/iteration-seq.json"
+        type: string
+      iteration_number:
+        description: "Optional: override the iteration number to create (manual runs only). Example: 12 creates Pre-Release-Iteration-12 and sets nextIterationNumber to 13."
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -39,21 +47,53 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           API_URL: ${{ github.api_url }}
           REPO: ${{ github.repository }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
 
           # schedule runs have no inputs, so guard with event_name
           BASE_BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.base_branch || 'main' }}
           PREFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.prefix || 'Pre-Release-Iteration-' }}
           COUNTER_PATH: ${{ github.event_name == 'workflow_dispatch' && inputs.counter_path || '.release/iteration-seq.json' }}
+
+          # Manual-only override (empty string means "no override")
+          ITERATION_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.iteration_number || '' }}
+
         run: |
           python3 - <<'PY'
-          import os, json, base64, urllib.request, urllib.parse
+          import os, json, base64, urllib.request, urllib.parse, re
+          from datetime import datetime, timedelta, timezone
 
+          # ----------------------------
+          # Biweekly gate (schedule only)
+          # ----------------------------
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+
+          if event_name == "schedule":
+            # Anchor: Monday 2026-01-26 (UTC week bucket)
+            ANCHOR = datetime(2026, 1, 26, 0, 0, tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+
+            # Week bucket starts Monday 00:00 UTC (robust if the run is delayed)
+            this_monday = (now - timedelta(days=now.weekday())).replace(
+              hour=0, minute=0, second=0, microsecond=0
+            )
+            weeks_since_anchor = (this_monday - ANCHOR).days // 7
+
+            if weeks_since_anchor % 2 != 0:
+              print(f"Off-week (weeks_since_anchor={weeks_since_anchor}). Exiting.")
+              raise SystemExit(0)
+          else:
+            print(f"Non-schedule run ({event_name}); bypassing biweekly gate.")
+
+          # ----------------------------
+          # Main logic
+          # ----------------------------
           token = os.environ["GH_TOKEN"]
           api_url = os.environ["API_URL"].rstrip("/")
           repo = os.environ["REPO"]
           base_branch = os.environ["BASE_BRANCH"]
           prefix = os.environ["PREFIX"]
           counter_path = os.environ["COUNTER_PATH"].lstrip("/")
+          override_raw = (os.environ.get("ITERATION_OVERRIDE") or "").strip()
 
           owner, name = repo.split("/", 1)
           base = f"{api_url}/repos/{owner}/{name}"
@@ -101,7 +141,7 @@ jobs:
               raw = base64.b64decode(content_b64).decode("utf-8")
               obj = json.loads(raw)
 
-              # New format: nextIterationNumber means "the next number to create"
+              # nextIterationNumber means "the next number to create"
               nxt = int(obj.get("nextIterationNumber", 1))
               return nxt, sha
 
@@ -128,12 +168,36 @@ jobs:
               raise SystemExit(f"Failed to write counter file: HTTP {status} {data}")
             return data
 
-          # 1) Determine next iteration number (monotonic increasing)
-          next_n, counter_sha = get_or_init_counter()
+          def parse_override(value: str):
+            if not value:
+              return None
+            if not re.fullmatch(r"\d+", value):
+              raise SystemExit(f"iteration_number must be a positive integer, got: '{value}'")
+            n = int(value)
+            if n <= 0:
+              raise SystemExit(f"iteration_number must be >= 1, got: {n}")
+            return n
+
+          override_n = parse_override(override_raw)
+
+          # 1) Determine iteration number to create
+          file_next, counter_sha = get_or_init_counter()
+
+          if override_n is not None:
+            next_n = override_n
+            print(f"Manual override provided. Will create iteration: {next_n}")
+          else:
+            next_n = file_next
+            print(f"No override provided. Using counter file nextIterationNumber: {next_n}")
+
           new_branch = f"{prefix}{next_n}"
 
-          print(f"Next iteration number from counter: {next_n}")
-          print(f"Creating next iteration branch: {new_branch}")
+          # Optional sanity: warn if override is behind file value
+          if override_n is not None and override_n < file_next:
+            print(f"WARNING: override ({override_n}) is less than file nextIterationNumber ({file_next}). "
+                  f"This may create a duplicate/older iteration number if it already exists.")
+
+          print(f"Creating iteration branch: {new_branch}")
 
           # 2) Create the branch ref from BASE_BRANCH HEAD
           base_sha = get_head_sha(base_branch)
@@ -142,7 +206,7 @@ jobs:
           status, resp = api_request("POST", create_ref_url, payload)
 
           if status == 422:
-            # If branch already exists, do NOT bump counter; just stop.
+            # If branch already exists, do NOT update counter; just stop.
             print(f"Branch already exists or invalid (422): {resp}")
             raise SystemExit(0)
           if status not in (200, 201):
@@ -150,7 +214,9 @@ jobs:
 
           print(f"Created branch: {new_branch}")
 
-          # 3) Bump the counter file so we never reuse numbers
-          write_counter(next_n + 1, counter_sha)
-          print(f"Counter updated to nextIterationNumber={next_n + 1} in {counter_path}")
+          # 3) Update the counter so the next auto run creates the following number
+          # If we created N, we set nextIterationNumber = N+1
+          new_next = next_n + 1
+          write_counter(new_next, counter_sha)
+          print(f"Counter updated to nextIterationNumber={new_next} in {counter_path}")
           PY
