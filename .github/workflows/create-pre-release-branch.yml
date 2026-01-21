@@ -1,0 +1,157 @@
+name: Create Pre-Release Iteration Branch (monotonic, every 10 min)
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: "Branch to branch off from"
+        required: false
+        default: "main"
+        type: string
+      prefix:
+        description: "Prefix for iteration branches"
+        required: false
+        default: "Pre-Release-Iteration-"
+        type: string
+      counter_path:
+        description: "Path to counter file in repo"
+        required: false
+        default: ".release/iteration-seq.json"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  # Prevents two runs from creating the same number at once
+  group: create-pre-release-iteration-monotonic
+  cancel-in-progress: false
+
+jobs:
+  create_branch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create next iteration branch using repo counter
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+
+          # schedule runs have no inputs, so guard with event_name
+          BASE_BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.base_branch || 'main' }}
+          PREFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.prefix || 'Pre-Release-Iteration-' }}
+          COUNTER_PATH: ${{ github.event_name == 'workflow_dispatch' && inputs.counter_path || '.release/iteration-seq.json' }}
+        run: |
+          python3 - <<'PY'
+          import os, json, base64, urllib.request, urllib.parse
+
+          token = os.environ["GH_TOKEN"]
+          api_url = os.environ["API_URL"].rstrip("/")
+          repo = os.environ["REPO"]
+          base_branch = os.environ["BASE_BRANCH"]
+          prefix = os.environ["PREFIX"]
+          counter_path = os.environ["COUNTER_PATH"].lstrip("/")
+
+          owner, name = repo.split("/", 1)
+          base = f"{api_url}/repos/{owner}/{name}"
+
+          def api_request(method, url, payload=None):
+            data = None
+            headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "iteration-branch-monotonic"
+            }
+            if payload is not None:
+              data = json.dumps(payload).encode("utf-8")
+              headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            try:
+              with urllib.request.urlopen(req) as resp:
+                body = resp.read().decode("utf-8")
+                return resp.status, json.loads(body) if body else None
+            except urllib.error.HTTPError as e:
+              body = e.read().decode("utf-8") if e.fp else ""
+              try:
+                parsed = json.loads(body) if body else {"message": str(e)}
+              except Exception:
+                parsed = {"message": body or str(e)}
+              return e.code, parsed
+
+          def get_head_sha(branch):
+            enc = urllib.parse.quote(branch, safe="")
+            url = f"{base}/git/ref/heads/{enc}"
+            status, data = api_request("GET", url)
+            if status != 200:
+              raise SystemExit(f"Failed to read base branch '{branch}': HTTP {status} {data}")
+            return data["object"]["sha"]
+
+          def get_or_init_counter():
+            # GET /contents/{path}?ref={base_branch}
+            url = f"{base}/contents/{urllib.parse.quote(counter_path)}?ref={urllib.parse.quote(base_branch)}"
+            status, data = api_request("GET", url)
+
+            if status == 200:
+              content_b64 = data.get("content", "")
+              sha = data.get("sha")
+              raw = base64.b64decode(content_b64).decode("utf-8")
+              obj = json.loads(raw)
+
+              # New format: currentIterationNumber means "last created"
+              current = int(obj.get("currentIterationNumber", 0))
+              return current, sha
+
+            if status == 404:
+              # Initialize as "nothing created yet"
+              return 0, None
+
+            raise SystemExit(f"Failed to read counter file: HTTP {status} {data}")
+
+          def write_counter(current_value, existing_sha):
+            message = f"chore(release): set currentIterationNumber to {current_value} [skip ci]"
+            body = json.dumps({"currentIterationNumber": current_value}, indent=2) + "\n"
+            payload = {
+              "message": message,
+              "content": base64.b64encode(body.encode("utf-8")).decode("utf-8"),
+              "branch": base_branch
+            }
+            if existing_sha:
+              payload["sha"] = existing_sha
+
+            url = f"{base}/contents/{urllib.parse.quote(counter_path)}"
+            status, data = api_request("PUT", url, payload)
+            if status not in (200, 201):
+              raise SystemExit(f"Failed to write counter file: HTTP {status} {data}")
+            return data
+
+          # 1) Determine next iteration number (monotonic increasing)
+          current_n, counter_sha = get_or_init_counter()
+          next_n = current_n + 1
+          new_branch = f"{prefix}{next_n}"
+
+          print(f"Current iteration number from counter: {current_n}")
+          print(f"Creating next iteration branch: {new_branch}")
+
+          # 2) Create the branch ref from BASE_BRANCH HEAD
+          base_sha = get_head_sha(base_branch)
+          create_ref_url = f"{base}/git/refs"
+          payload = {"ref": f"refs/heads/{new_branch}", "sha": base_sha}
+          status, resp = api_request("POST", create_ref_url, payload)
+
+          if status == 422:
+            # If branch already exists, do NOT bump counter; just stop.
+            print(f"Branch already exists or invalid (422): {resp}")
+            raise SystemExit(0)
+          if status not in (200, 201):
+            raise SystemExit(f"Failed to create branch: HTTP {status} {resp}")
+
+          print(f"Created branch: {new_branch}")
+
+          # 3) Update the counter file to the newly created iteration number
+          write_counter(next_n, counter_sha)
+          print(f"Counter updated to {next_n} in {counter_path}")
+          PY

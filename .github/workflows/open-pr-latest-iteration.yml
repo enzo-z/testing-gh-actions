@@ -1,5 +1,6 @@
 name: Open PR from latest Pre-Release Iteration to main (every 15 min)
 
+# Modify: cron time and user (enzo-z)
 on:
   schedule:
     - cron: "*/15 * * * *"
@@ -45,10 +46,10 @@ jobs:
           API_URL: ${{ github.api_url }}
           REPO: ${{ github.repository }}
 
-          BASE_BRANCH: ${{ inputs.base_branch || 'main' }}
-          PREFIX: ${{ inputs.prefix || 'Pre-Release-Iteration-' }}
-          ASSIGNEE: ${{ inputs.assignee || 'enzo-z' }}
-          REVIEWER: ${{ inputs.reviewer || '' }}
+          BASE_BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.base_branch || 'main' }}
+          PREFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.prefix || 'Pre-Release-Iteration-' }}
+          ASSIGNEE: ${{ github.event_name == 'workflow_dispatch' && inputs.assignee || 'PUT_GITHUB_USERNAME_HERE' }}
+          REVIEWER: ${{ github.event_name == 'workflow_dispatch' && inputs.reviewer || '' }}
         run: |
           python3 - <<'PY'
           import os, re, json
