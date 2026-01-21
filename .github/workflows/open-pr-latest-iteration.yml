@@ -1,9 +1,12 @@
-name: Open PR from latest Pre-Release Iteration to main (every 15 min)
+name: Open PR from latest Pre-Release Iteration to main (biweekly on Fridays, 5pm EST)
 
-# Modify: cron time and user (enzo-z)
 on:
+  # Cron is evaluated in UTC.
+  # 22:00 UTC == 17:00 EST 
+  # NOTE: This is fixed to EST (no DST adjustment).
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "0 22 * * 5"
+
   workflow_dispatch:
     inputs:
       base_branch:
@@ -17,12 +20,12 @@ on:
         default: "Pre-Release-Iteration-"
         type: string
       assignee:
-        description: "GitHub username to assign the PR to"
-        required: true
+        description: "GitHub username to assign the PR to (manual runs only)"
+        required: false
         default: "enzo-z"
         type: string
       reviewer:
-        description: "Optional GitHub username to request review from"
+        description: "Optional GitHub username to request review from (manual runs only)"
         required: false
         default: ""
         type: string
@@ -30,9 +33,10 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write  # needed because assigning uses the Issues API
 
 concurrency:
-  group: open-pr-latest-iteration
+  group: open-pr-latest-iteration-biweekly
   cancel-in-progress: false
 
 jobs:
@@ -40,31 +44,69 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Create/ensure PR for latest iteration branch
+      - name: Create/ensure PR for latest iteration branch (biweekly gate on Fridays)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           API_URL: ${{ github.api_url }}
           REPO: ${{ github.repository }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
 
           BASE_BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.base_branch || 'main' }}
           PREFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.prefix || 'Pre-Release-Iteration-' }}
-          ASSIGNEE: ${{ github.event_name == 'workflow_dispatch' && inputs.assignee || 'PUT_GITHUB_USERNAME_HERE' }}
+
+          ASSIGNEE: ${{ github.event_name == 'workflow_dispatch' && inputs.assignee || 'enzo-z' }} # Change default as needed
           REVIEWER: ${{ github.event_name == 'workflow_dispatch' && inputs.reviewer || '' }}
         run: |
           python3 - <<'PY'
           import os, re, json
           import urllib.request, urllib.parse
+          from datetime import datetime, timedelta, timezone
 
+          # ----------------------------
+          # Biweekly gate (schedule only)
+          # ----------------------------
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+
+          if event_name == "schedule":
+            # Anchor: Friday 2026-01-23 00:00 UTC (week bucket)
+            ANCHOR = datetime(2026, 1, 23, 0, 0, tzinfo=timezone.utc)
+
+            now = datetime.now(timezone.utc)
+
+            # "This Friday" bucket starts Friday 00:00 UTC
+            # weekday(): Monday=0 ... Friday=4
+            days_since_friday = (now.weekday() - 4) % 7
+            this_friday = (now - timedelta(days=days_since_friday)).replace(
+              hour=0, minute=0, second=0, microsecond=0
+            )
+
+            weeks_since_anchor = (this_friday - ANCHOR).days // 7
+            if weeks_since_anchor < 0:
+              print(f"Before anchor week (weeks_since_anchor={weeks_since_anchor}). Exiting.")
+              raise SystemExit(0)
+
+            # Run only on even buckets: 0,2,4...
+            if weeks_since_anchor % 2 != 0:
+              print(f"Off-week (weeks_since_anchor={weeks_since_anchor}). Exiting.")
+              raise SystemExit(0)
+
+            print(f"On-week (weeks_since_anchor={weeks_since_anchor}). Proceeding.")
+          else:
+            print(f"Non-schedule run ({event_name}); bypassing biweekly gate.")
+
+          # ----------------------------
+          # Main logic
+          # ----------------------------
           token = os.environ["GH_TOKEN"]
           api_url = os.environ["API_URL"].rstrip("/")
           repo = os.environ["REPO"]
           base_branch = os.environ["BASE_BRANCH"]
           prefix = os.environ["PREFIX"]
-          assignee = os.environ["ASSIGNEE"].strip()
-          reviewer = os.environ["REVIEWER"].strip()
+          assignee = (os.environ.get("ASSIGNEE") or "").strip()
+          reviewer = (os.environ.get("REVIEWER") or "").strip()
 
-          if not assignee or assignee == "PUT_GITHUB_USERNAME_HERE":
-            raise SystemExit("Please set ASSIGNEE (either via workflow_dispatch input or by editing the YAML default).")
+          if not assignee:
+            raise SystemExit("ASSIGNEE is empty. Set it in workflow env/inputs/vars.")
 
           owner, name = repo.split("/", 1)
           base = f"{api_url}/repos/{owner}/{name}"
@@ -126,7 +168,6 @@ jobs:
           print(f"Latest iteration branch: {latest_branch}")
 
           # 2) Check if an open PR already exists from latest_branch -> base_branch
-          # Use the pulls list endpoint filtered by head/base.
           head = urllib.parse.quote(f"{owner}:{latest_branch}", safe="")
           base_q = urllib.parse.quote(base_branch, safe="")
           pulls_url = f"{base}/pulls?state=open&head={head}&base={base_q}"
