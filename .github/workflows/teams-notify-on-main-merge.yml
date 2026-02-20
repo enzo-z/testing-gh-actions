@@ -11,129 +11,210 @@ permissions:
 
 jobs:
   notify:
-    # Only run when PR was merged AND it was from an iteration branch
     if: >
       github.event.pull_request.merged == true &&
       startsWith(github.event.pull_request.head.ref, 'Pre-Release-Iteration-')
     runs-on: ubuntu-latest
 
     steps:
-      - name: Build message (find PRs merged into iteration branch)
+      - name: Build Teams payload (find PRs merged into iteration branch + parse template)
         id: build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           API_URL: ${{ github.api_url }}
           REPO: ${{ github.repository }}
-          DEFAULT_BRANCH: main
-          MERGED_FROM_BRANCH: ${{ github.event.pull_request.head.ref }}
+
+          TARGET_BRANCH: Release-Non-Prod
+          SOURCE_BRANCH: ${{ github.event.pull_request.head.ref }}
+
           MERGE_PR_TITLE: ${{ github.event.pull_request.title }}
           MERGE_PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
           python3 - <<'PY'
-          import os, json, urllib.parse, urllib.request, re
+          import os, json, re, urllib.parse, urllib.request
 
           token = os.environ["GH_TOKEN"]
           api_url = os.environ["API_URL"].rstrip("/")
           repo = os.environ["REPO"]
-          default_branch = os.environ["DEFAULT_BRANCH"]
-          merged_from = os.environ["MERGED_FROM_BRANCH"]
+          target_branch = os.environ["TARGET_BRANCH"]
+          source_branch = os.environ["SOURCE_BRANCH"]
           merge_pr_title = os.environ.get("MERGE_PR_TITLE","")
           merge_pr_url = os.environ.get("MERGE_PR_URL","")
 
           owner, name = repo.split("/", 1)
           base = f"{api_url}/repos/{owner}/{name}"
 
-          def api_request(url):
+          def request(method, url, payload=None):
+            data = None
             headers = {
               "Accept": "application/vnd.github+json",
               "Authorization": f"Bearer {token}",
               "X-GitHub-Api-Version": "2022-11-28",
               "User-Agent": "teams-notify-workflow"
             }
-            req = urllib.request.Request(url, headers=headers, method="GET")
-            with urllib.request.urlopen(req) as resp:
-              body = resp.read().decode("utf-8")
-              return resp.status, json.loads(body) if body else None
+            if payload is not None:
+              data = json.dumps(payload).encode("utf-8")
+              headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(url, headers=headers, data=data, method=method)
+            try:
+              with urllib.request.urlopen(req) as resp:
+                body = resp.read().decode("utf-8")
+                return resp.status, json.loads(body) if body else None
+            except urllib.error.HTTPError as e:
+              body = e.read().decode("utf-8") if e.fp else ""
+              try:
+                parsed = json.loads(body) if body else {"message": str(e)}
+              except Exception:
+                parsed = {"message": body or str(e)}
+              return e.code, parsed
 
-          # Search merged PRs whose BASE is the iteration branch
-          # This uses GitHub search qualifiers (repo, is:pr, is:merged, base:branch). :contentReference[oaicite:3]{index=3}
-          query = f"repo:{repo} is:pr is:merged base:{merged_from}"
-          q = urllib.parse.quote(query, safe="")
-          per_page = 100
-          page = 1
-          items = []
+          def search_merged_prs_into_branch(branch: str):
+            # Search merged PRs whose BASE is the iteration branch
+            query = f"repo:{repo} is:pr is:merged base:{branch}"
+            q = urllib.parse.quote(query, safe="")
+            per_page = 100
+            page = 1
+            items = []
+            while True:
+              url = f"{api_url}/search/issues?q={q}&per_page={per_page}&page={page}"
+              status, data = request("GET", url)
+              if status != 200:
+                raise SystemExit(f"Search failed: HTTP {status} {data}")
+              batch = data.get("items", [])
+              if not batch:
+                break
+              items.extend(batch)
+              total = data.get("total_count", 0)
+              if len(items) >= total:
+                break
+              page += 1
+              if page > 10:
+                break
+            return items
 
-          while True:
-            url = f"{api_url}/search/issues?q={q}&per_page={per_page}&page={page}"
-            status, data = api_request(url)
+          def get_pr(number: int):
+            url = f"{base}/pulls/{number}"
+            status, data = request("GET", url)
             if status != 200:
-              raise SystemExit(f"Search failed: HTTP {status} {data}")
+              raise SystemExit(f"Failed to read PR #{number}: HTTP {status} {data}")
+            return data
 
-            batch = data.get("items", [])
-            if not batch:
-              break
+          # --- PR template parsing helpers ---
+          # Your template uses:
+          # #### User Story/Task
+          # > **Link:** <markdown link>
+          # ---
+          # # Summary
+          # ...
+          # # Screenshots
+          # ...
+          def extract_section(text: str, header_regex: str):
+            """
+            Extracts text under a header until the next header or end.
+            header_regex should match the header line itself.
+            """
+            if not text:
+              return ""
+            # normalize newlines
+            t = text.replace("\r\n", "\n")
+            m = re.search(header_regex, t, flags=re.IGNORECASE | re.MULTILINE)
+            if not m:
+              return ""
+            start = m.end()
+            # next header: line starting with # (any level)
+            m2 = re.search(r"(?m)^\s*#\s+", t[start:])
+            end = start + m2.start() if m2 else len(t)
+            return t[start:end].strip()
 
-            items.extend(batch)
+          def extract_rally_link(body: str):
+            if not body:
+              return ""
+            # Try to find the markdown link after "**Link:**"
+            # e.g. > **Link:** [US123 - Name](https://rally...)
+            m = re.search(r"\*\*Link:\*\*\s*(.+)", body, flags=re.IGNORECASE)
+            if not m:
+              return ""
+            link_part = m.group(1).strip()
+            # If it's a markdown link, keep it as-is; otherwise return raw text
+            return link_part
 
-            # stop if we've got all results
-            total = data.get("total_count", 0)
-            if len(items) >= total:
-              break
+          def strip_html_url(url: str) -> str:
+            return url or ""
 
-            page += 1
-            if page > 10:  # safety cap (max 1000 results)
-              break
+          # --- build PR list for Teams schema ---
+          merged_items = search_merged_prs_into_branch(source_branch)
 
-          # Build a readable list (cap to avoid huge Teams messages)
+          # cap to avoid huge Teams messages
           MAX_LIST = 25
-          lines = []
-          for pr in items[:MAX_LIST]:
-            number = pr.get("number")
+          pull_requests = []
+
+          for item in merged_items[:MAX_LIST]:
+            number = item.get("number")
+            if not number:
+              continue
+
+            pr = get_pr(int(number))
+            pr_body = pr.get("body") or ""
+
+            rally = extract_rally_link(pr_body)
+            summary = extract_section(pr_body, r"(?m)^\s*#\s+Summary\s*$")
+            screenshots = extract_section(pr_body, r"(?m)^\s*#\s+Screenshots\s*$")
+
+            # Teams schema wants only number/title/url, but we can enrich the title
+            # by appending Rally info if present (keeps schema unchanged).
             title = (pr.get("title") or "").strip()
-            url = pr.get("html_url") or pr.get("url") or ""
-            lines.append(f"- #{number} {title} ({url})")
+            if rally:
+              # keep it short; Teams message can show rally link next to title
+              title = f"{title} — {rally}"
 
-          remaining = len(items) - len(lines)
-          if remaining > 0:
-            lines.append(f"- …and {remaining} more")
+            # If you prefer NOT to modify title, comment above and instead
+            # include rally/summary/screenshots elsewhere later.
+            pull_requests.append({
+              "number": int(pr.get("number")),
+              "title": title,
+              "url": strip_html_url(pr.get("html_url"))
+            })
 
-          pr_list_text = "\n".join(lines) if lines else "- (No PRs found merged into that branch)"
-
-          message = (
-            f"A new version of **{default_branch}** was generated!\n\n"
-            f"This new version was a result of the work done in **{merged_from}**.\n\n"
-            f"Merge PR: {merge_pr_title} ({merge_pr_url})\n\n"
-            f"**Changes included in this version:**\n{pr_list_text}"
+          remaining = len(merged_items) - len(pull_requests)
+          title = (
+            f"A new version of {target_branch} was generated! "
+            f"({source_branch} → {target_branch})"
           )
 
-          # Write to GITHUB_OUTPUT for the next step
+          if remaining > 0:
+            # Add a final pseudo-entry indicating there are more (still schema-compliant)
+            pull_requests.append({
+              "number": 0,
+              "title": f"...and {remaining} more PR(s) merged into {source_branch}",
+              "url": merge_pr_url
+            })
+
+          payload = {
+            "title": title,
+            "sourceBranch": source_branch,
+            "targetBranch": target_branch,
+            "pullRequests": pull_requests
+          }
+
           out_path = os.environ["GITHUB_OUTPUT"]
           with open(out_path, "a", encoding="utf-8") as f:
-            f.write("message<<EOF\n")
-            f.write(message)
+            f.write("teams_payload<<EOF\n")
+            f.write(json.dumps(payload))
             f.write("\nEOF\n")
 
-          print(message)
+          print(json.dumps(payload, indent=2))
           PY
 
-      - name: Send message to Microsoft Teams (Workflows webhook)
+      - name: Send payload to Microsoft Teams (Workflows webhook)
         env:
-          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }} # NEEDS TO IMPLEMENT THIS SECRET
-          MESSAGE: ${{ steps.build.outputs.message }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          TEAMS_PAYLOAD: ${{ steps.build.outputs.teams_payload }}
         run: |
           if [ -z "$TEAMS_WEBHOOK_URL" ]; then
             echo "Missing TEAMS_WEBHOOK_URL secret"
             exit 1
           fi
 
-          # Send payload that your Teams Workflow can read (e.g., { "text": "..." }).
-          # In the Teams Workflow, map 'text' into the message body.
-          payload=$(python3 - <<'PY'
-          import os, json
-          print(json.dumps({"text": os.environ["MESSAGE"]}))
-          PY
-          )
-
           curl -sS -X POST "$TEAMS_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
-            -d "$payload"
+            -d "$TEAMS_PAYLOAD"
