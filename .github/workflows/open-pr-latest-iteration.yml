@@ -1,18 +1,18 @@
-name: Open PR from latest Pre-Release Iteration to main (biweekly on Fridays, 5pm EST)
+name: Open PR from latest Pre-Release Iteration to main (biweekly on Fridays, 2pm EST)
 
 on:
   # Cron is evaluated in UTC.
-  # 22:00 UTC == 17:00 EST 
+  # 19:00 UTC == 14:00 EST
   # NOTE: This is fixed to EST (no DST adjustment).
   schedule:
-    - cron: "0 22 * * 5"
+    - cron: "0 19 * * 5"
 
   workflow_dispatch:
     inputs:
       base_branch:
-        description: "Base branch to merge into (default is main)"
+        description: "Base branch to merge into (default is Release-Non-Prod)"
         required: false
-        default: "main"
+        default: "Release-Non-Prod"
         type: string
       prefix:
         description: "Iteration branch prefix"
@@ -22,7 +22,7 @@ on:
       assignee:
         description: "GitHub username to assign the PR to (manual runs only)"
         required: false
-        default: "enzo-z"
+        default: "Nicolas-Weber_cvsh"
         type: string
       reviewer:
         description: "Optional GitHub username to request review from (manual runs only)"
@@ -31,9 +31,9 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
-  issues: write  # needed because assigning uses the Issues API
+  issues: write
 
 concurrency:
   group: open-pr-latest-iteration-biweekly
@@ -44,21 +44,23 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Create/ensure PR for latest iteration branch (biweekly gate on Fridays)
+      - name: Create/ensure PR for latest iteration branch (and bump counter on branch)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           API_URL: ${{ github.api_url }}
           REPO: ${{ github.repository }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
 
-          BASE_BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.base_branch || 'main' }}
+          BASE_BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.base_branch || 'Release-Non-Prod' }}
           PREFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.prefix || 'Pre-Release-Iteration-' }}
 
-          ASSIGNEE: ${{ github.event_name == 'workflow_dispatch' && inputs.assignee || 'enzo-z' }} # Change default as needed
+          ASSIGNEE: ${{ github.event_name == 'workflow_dispatch' && inputs.assignee || 'enzo-z' }}
           REVIEWER: ${{ github.event_name == 'workflow_dispatch' && inputs.reviewer || '' }}
+
+          COUNTER_PATH: .release/iteration-seq.json
         run: |
           python3 - <<'PY'
-          import os, re, json
+          import os, re, json, base64
           import urllib.request, urllib.parse
           from datetime import datetime, timedelta, timezone
 
@@ -68,13 +70,11 @@ jobs:
           event_name = os.environ.get("GITHUB_EVENT_NAME", "")
 
           if event_name == "schedule":
-            # Anchor: Friday 2026-01-23 00:00 UTC (week bucket)
-            ANCHOR = datetime(2026, 1, 23, 0, 0, tzinfo=timezone.utc)
-
+            # Anchor: Friday 2026-01-23 00:00:00 UTC (a known release date in the past, can be any Friday)
+            ANCHOR = datetime(2026, 1, 23, 0, 0, tzinfo=timezone.utc)  
             now = datetime.now(timezone.utc)
 
-            # "This Friday" bucket starts Friday 00:00 UTC
-            # weekday(): Monday=0 ... Friday=4
+            # Friday bucket start 00:00 UTC
             days_since_friday = (now.weekday() - 4) % 7
             this_friday = (now - timedelta(days=days_since_friday)).replace(
               hour=0, minute=0, second=0, microsecond=0
@@ -85,7 +85,6 @@ jobs:
               print(f"Before anchor week (weeks_since_anchor={weeks_since_anchor}). Exiting.")
               raise SystemExit(0)
 
-            # Run only on even buckets: 0,2,4...
             if weeks_since_anchor % 2 != 0:
               print(f"Off-week (weeks_since_anchor={weeks_since_anchor}). Exiting.")
               raise SystemExit(0)
@@ -104,9 +103,10 @@ jobs:
           prefix = os.environ["PREFIX"]
           assignee = (os.environ.get("ASSIGNEE") or "").strip()
           reviewer = (os.environ.get("REVIEWER") or "").strip()
+          counter_path = (os.environ.get("COUNTER_PATH") or ".release/iteration-seq.json").lstrip("/")
 
           if not assignee:
-            raise SystemExit("ASSIGNEE is empty. Set it in workflow env/inputs/vars.")
+            raise SystemExit("ASSIGNEE is empty. Set it in workflow env/inputs.")
 
           owner, name = repo.split("/", 1)
           base = f"{api_url}/repos/{owner}/{name}"
@@ -165,7 +165,8 @@ jobs:
             print(f"No branches found matching {prefix}<number>. Nothing to do.")
             raise SystemExit(0)
 
-          print(f"Latest iteration branch: {latest_branch}")
+          latest_n = max_n
+          print(f"Latest iteration branch: {latest_branch} (N={latest_n})")
 
           # 2) Check if an open PR already exists from latest_branch -> base_branch
           head = urllib.parse.quote(f"{owner}:{latest_branch}", safe="")
@@ -180,7 +181,50 @@ jobs:
             print(f"PR already exists: #{pr.get('number')} {pr.get('html_url')}")
             raise SystemExit(0)
 
-          # 3) Create the PR
+          # 3) Read nextIterationNumber from base branch (Release-Non-Prod)
+          contents_url = f"{base}/contents/{urllib.parse.quote(counter_path)}?ref={urllib.parse.quote(base_branch)}"
+          status, data = api_request("GET", contents_url)
+          if status != 200:
+            raise SystemExit(f"Failed to read counter file on {base_branch}: HTTP {status} {data}")
+
+          file_sha_on_base = data.get("sha")
+          raw = base64.b64decode(data.get("content", "")).decode("utf-8")
+          obj = json.loads(raw or "{}")
+          current_next = int(obj.get("nextIterationNumber", 1))
+
+          desired_next = latest_n + 1
+          new_next = max(current_next, desired_next)
+
+          print(f"Counter on {base_branch}: nextIterationNumber={current_next}")
+          print(f"Will ensure nextIterationNumber becomes: {new_next} (desired={desired_next})")
+
+          # 4) Commit updated counter file onto the iteration branch (latest_branch)
+          #    (So it is updated only when the PR merges into Release-Non-Prod)
+          # First, get the file SHA as it exists on the iteration branch (might differ).
+          contents_url_iter = f"{base}/contents/{urllib.parse.quote(counter_path)}?ref={urllib.parse.quote(latest_branch)}"
+          status, data_iter = api_request("GET", contents_url_iter)
+          if status != 200:
+            raise SystemExit(f"Failed to read counter file on {latest_branch}: HTTP {status} {data_iter}")
+
+          file_sha_on_iter = data_iter.get("sha")
+
+          updated_obj = {"nextIterationNumber": new_next}
+          updated_body = json.dumps(updated_obj, indent=2) + "\n"
+          put_payload = {
+            "message": f"chore(release): bump nextIterationNumber to {new_next} [skip ci]",
+            "content": base64.b64encode(updated_body.encode("utf-8")).decode("utf-8"),
+            "branch": latest_branch,
+            "sha": file_sha_on_iter
+          }
+
+          put_url = f"{base}/contents/{urllib.parse.quote(counter_path)}"
+          status, put_resp = api_request("PUT", put_url, put_payload)
+          if status not in (200, 201):
+            raise SystemExit(f"Failed to update counter on {latest_branch}: HTTP {status} {put_resp}")
+
+          print(f"Updated {counter_path} on {latest_branch} to nextIterationNumber={new_next}")
+
+          # 5) Create the PR
           create_pr_url = f"{base}/pulls"
           payload = {
             "title": f"Merge {latest_branch} -> {base_branch}",
@@ -189,7 +233,8 @@ jobs:
             "body": (
               f"Automated PR created by GitHub Actions.\n\n"
               f"Source: `{latest_branch}`\n"
-              f"Target: `{base_branch}`\n"
+              f"Target: `{base_branch}`\n\n"
+              f"This PR also bumps `{counter_path}` to `{new_next}` so the next iteration branch can be created."
             ),
             "maintainer_can_modify": True
           }
@@ -200,14 +245,14 @@ jobs:
           pr_number = pr["number"]
           print(f"Created PR #{pr_number}: {pr.get('html_url')}")
 
-          # 4) Assign a user (assignee)
+          # 6) Assign a user (assignee)
           issue_url = f"{base}/issues/{pr_number}"
           status, resp = api_request("PATCH", issue_url, {"assignees": [assignee]})
           if status not in (200, 201):
             raise SystemExit(f"Failed to assign PR: HTTP {status} {resp}")
           print(f"Assigned PR to: {assignee}")
 
-          # 5) Optionally request a reviewer
+          # 7) Optionally request a reviewer
           if reviewer:
             reviewers_url = f"{base}/pulls/{pr_number}/requested_reviewers"
             status, resp = api_request("POST", reviewers_url, {"reviewers": [reviewer]})
