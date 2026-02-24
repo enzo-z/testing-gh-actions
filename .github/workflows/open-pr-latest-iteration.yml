@@ -54,7 +54,7 @@ jobs:
           BASE_BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.base_branch || 'Release-Non-Prod' }}
           PREFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.prefix || 'Pre-Release-Iteration-' }}
 
-          ASSIGNEE: ${{ github.event_name == 'workflow_dispatch' && inputs.assignee || 'enzo-z' }}
+          ASSIGNEE: ${{ github.event_name == 'workflow_dispatch' && inputs.assignee || 'Nicolas-Weber_cvsh' }}
           REVIEWER: ${{ github.event_name == 'workflow_dispatch' && inputs.reviewer || '' }}
 
           COUNTER_PATH: .release/iteration-seq.json
@@ -187,7 +187,7 @@ jobs:
           if status != 200:
             raise SystemExit(f"Failed to read counter file on {base_branch}: HTTP {status} {data}")
 
-          file_sha_on_base = data.get("sha")
+          # file_sha_on_base was unused -> removed
           raw = base64.b64decode(data.get("content", "")).decode("utf-8")
           obj = json.loads(raw or "{}")
           current_next = int(obj.get("nextIterationNumber", 1))
@@ -200,7 +200,6 @@ jobs:
 
           # 4) Commit updated counter file onto the iteration branch (latest_branch)
           #    (So it is updated only when the PR merges into Release-Non-Prod)
-          # First, get the file SHA as it exists on the iteration branch (might differ).
           contents_url_iter = f"{base}/contents/{urllib.parse.quote(counter_path)}?ref={urllib.parse.quote(latest_branch)}"
           status, data_iter = api_request("GET", contents_url_iter)
           if status != 200:
@@ -208,21 +207,29 @@ jobs:
 
           file_sha_on_iter = data_iter.get("sha")
 
-          updated_obj = {"nextIterationNumber": new_next}
-          updated_body = json.dumps(updated_obj, indent=2) + "\n"
-          put_payload = {
-            "message": f"chore(release): bump nextIterationNumber to {new_next} [skip ci]",
-            "content": base64.b64encode(updated_body.encode("utf-8")).decode("utf-8"),
-            "branch": latest_branch,
-            "sha": file_sha_on_iter
-          }
+          # Decode current value on the iteration branch to avoid unnecessary commits
+          raw_iter = base64.b64decode(data_iter.get("content", "")).decode("utf-8")
+          obj_iter = json.loads(raw_iter or "{}")
+          iter_next = int(obj_iter.get("nextIterationNumber", 1))
 
-          put_url = f"{base}/contents/{urllib.parse.quote(counter_path)}"
-          status, put_resp = api_request("PUT", put_url, put_payload)
-          if status not in (200, 201):
-            raise SystemExit(f"Failed to update counter on {latest_branch}: HTTP {status} {put_resp}")
+          if iter_next == new_next:
+            print(f"{counter_path} on {latest_branch} already has nextIterationNumber={new_next}. Skipping update.")
+          else:
+            updated_obj = {"nextIterationNumber": new_next}
+            updated_body = json.dumps(updated_obj, indent=2) + "\n"
+            put_payload = {
+              "message": f"chore(release): bump nextIterationNumber to {new_next} [skip ci]",
+              "content": base64.b64encode(updated_body.encode("utf-8")).decode("utf-8"),
+              "branch": latest_branch,
+              "sha": file_sha_on_iter
+            }
 
-          print(f"Updated {counter_path} on {latest_branch} to nextIterationNumber={new_next}")
+            put_url = f"{base}/contents/{urllib.parse.quote(counter_path)}"
+            status, put_resp = api_request("PUT", put_url, put_payload)
+            if status not in (200, 201):
+              raise SystemExit(f"Failed to update counter on {latest_branch}: HTTP {status} {put_resp}")
+
+            print(f"Updated {counter_path} on {latest_branch} to nextIterationNumber={new_next}")
 
           # 5) Create the PR
           create_pr_url = f"{base}/pulls"
