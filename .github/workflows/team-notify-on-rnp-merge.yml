@@ -1,0 +1,228 @@
+name: Notify Teams on merge to Release-Non-Prod (with included PRs)
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [Release-Non-Prod] # base branch (target)
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read # needed for /search/issues even when searching PRs (is:pr)
+
+jobs:
+  notify:
+    # Run when any PR is merged into Release-Non-Prod
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Build Teams payload
+        id: build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+
+          TARGET_BRANCH: Release-Non-Prod
+          SOURCE_BRANCH: ${{ github.event.pull_request.head.ref }}
+          MERGE_PR_NUMBER: ${{ github.event.pull_request.number }}
+          MERGE_PR_TITLE: ${{ github.event.pull_request.title }}
+          MERGE_PR_URL: ${{ github.event.pull_request.html_url }}
+          MERGE_PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python3 - <<'PY'
+          import os, json, re, uuid
+          import urllib.parse, urllib.request
+
+          token = os.environ["GH_TOKEN"]
+          api_url = os.environ["API_URL"].rstrip("/")
+          repo = os.environ["REPO"]
+          target_branch = os.environ["TARGET_BRANCH"]
+          source_branch = os.environ["SOURCE_BRANCH"]
+          merge_pr_url = os.environ.get("MERGE_PR_URL","")
+
+          owner, name = repo.split("/", 1)
+          base = f"{api_url}/repos/{owner}/{name}"
+
+          def request(method, url, payload=None):
+            data = None
+            headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "teams-notify-workflow"
+            }
+            if payload is not None:
+              data = json.dumps(payload).encode("utf-8")
+              headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(url, headers=headers, data=data, method=method)
+            try:
+              with urllib.request.urlopen(req) as resp:
+                body = resp.read().decode("utf-8")
+                return resp.status, json.loads(body) if body else None
+            except urllib.error.HTTPError as e:
+              body = e.read().decode("utf-8") if e.fp else ""
+              try:
+                parsed = json.loads(body) if body else {"message": str(e)}
+              except Exception:
+                parsed = {"message": body or str(e)}
+              return e.code, parsed
+
+          def search_merged_prs_into_branch(branch: str):
+            # Search merged PRs whose BASE is the iteration branch
+            query = f"repo:{repo} is:pr is:merged base:{branch}"
+            q = urllib.parse.quote(query, safe="")
+            per_page = 100
+            page = 1
+            items = []
+
+            while True:
+              # Add stable ordering so output is deterministic
+              url = f"{api_url}/search/issues?q={q}&per_page={per_page}&page={page}&sort=updated&order=desc"
+              status, data = request("GET", url)
+              if status != 200:
+                raise SystemExit(f"Search failed: HTTP {status} {data}")
+
+              batch = data.get("items", [])
+              if not batch:
+                break
+
+              items.extend(batch)
+              total = data.get("total_count", 0)
+              if len(items) >= total:
+                break
+
+              page += 1
+              if page > 10:  # safety cap (max 1000 results)
+                break
+
+            return items
+
+          def get_pr(number: int):
+            url = f"{base}/pulls/{number}"
+            status, data = request("GET", url)
+            if status != 200:
+              raise SystemExit(f"Failed to read PR #{number}: HTTP {status} {data}")
+            return data
+
+          def extract_rally_link(body: str):
+            """
+            Finds the PR template line like:
+            > **Link:** [US123 - Name](https://rally...)
+            Returns the markdown link (or raw text) after **Link:**
+            """
+            if not body:
+              return ""
+            m = re.search(r"\*\*Link:\*\*\s*(.+)", body, flags=re.IGNORECASE)
+            return m.group(1).strip() if m else ""
+
+          def extract_url_from_markdown_link(text: str) -> str:
+            """Extracts the raw URL from a markdown link like [label](https://...)."""
+            m = re.search(r"\[[^\]]+\]\((https?://[^)]+)\)", text or "")
+            return m.group(1) if m else ""
+
+          def iteration_number_from_branch(branch: str):
+            m = re.search(r"(\d+)$", branch)
+            return int(m.group(1)) if m else None
+
+          is_iteration = source_branch.startswith("Pre-Release-Iteration-")
+
+          # --- build PR list for Teams schema ---
+          pull_requests = []
+
+          if is_iteration:
+            # Iteration branch merge: list all PRs that were merged into the iteration branch
+            merged_items = search_merged_prs_into_branch(source_branch)
+
+            MAX_LIST = 25
+            for item in merged_items[:MAX_LIST]:
+              number = item.get("number")
+              if not number:
+                continue
+
+              pr = get_pr(int(number))
+              pr_body = pr.get("body") or ""
+
+              rally = extract_rally_link(pr_body)
+              rally_url = extract_url_from_markdown_link(rally) if rally else ""
+
+              pr_title = (pr.get("title") or "").strip()
+              if rally_url:
+                pr_title = f"{pr_title} — {rally_url}"
+              elif rally:
+                pr_title = f"{pr_title} — {rally}"
+
+              pull_requests.append({
+                "number": int(pr.get("number")),
+                "title": pr_title,
+                "url": pr.get("html_url") or ""
+              })
+
+            remaining = len(merged_items) - len(pull_requests)
+
+            iter_n = iteration_number_from_branch(source_branch)
+            if iter_n is not None:
+              title = f"{target_branch} updated — Iteration {iter_n} merged"
+            else:
+              title = f"{target_branch} updated — {source_branch} merged"
+
+            if remaining > 0:
+              pull_requests.append({
+                "number": 0,
+                "title": f"...and {remaining} more PR(s) merged into {source_branch}",
+                "url": merge_pr_url
+              })
+          else:
+            # Direct PR to RNP (e.g. hotfix): report the single PR itself
+            merge_pr_number = int(os.environ.get("MERGE_PR_NUMBER", "0"))
+            merge_pr_title = os.environ.get("MERGE_PR_TITLE", "").strip()
+            merge_pr_body = os.environ.get("MERGE_PR_BODY", "")
+
+            rally = extract_rally_link(merge_pr_body)
+            rally_url = extract_url_from_markdown_link(rally) if rally else ""
+            if rally_url:
+              merge_pr_title = f"{merge_pr_title} — {rally_url}"
+            elif rally:
+              merge_pr_title = f"{merge_pr_title} — {rally}"
+
+            pull_requests.append({
+              "number": merge_pr_number,
+              "title": merge_pr_title,
+              "url": merge_pr_url
+            })
+
+            title = f"{target_branch} updated — Direct PR merged from {source_branch}"
+
+          payload = {
+            "title": title,
+            "sourceBranch": source_branch,
+            "targetBranch": target_branch,
+            "pullRequests": pull_requests
+          }
+
+          # Robustly write JSON to GITHUB_OUTPUT using a unique delimiter
+          payload_json = json.dumps(payload)
+          delimiter = f"EOF_{uuid.uuid4().hex}"
+          out_path = os.environ["GITHUB_OUTPUT"]
+          with open(out_path, "a", encoding="utf-8") as f:
+            f.write(f"teams_payload<<{delimiter}\n")
+            f.write(payload_json)
+            f.write(f"\n{delimiter}\n")
+
+          print(json.dumps(payload, indent=2))
+          PY
+
+      - name: Send payload to Microsoft Teams (Workflows webhook)
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          TEAMS_PAYLOAD: ${{ steps.build.outputs.teams_payload }}
+        run: |
+          if [ -z "$TEAMS_WEBHOOK_URL" ]; then
+            echo "Missing TEAMS_WEBHOOK_URL secret"
+            exit 1
+          fi
+
+          curl -sS --fail-with-body -X POST "$TEAMS_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$TEAMS_PAYLOAD"
