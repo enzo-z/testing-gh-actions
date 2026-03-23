@@ -31,7 +31,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: write
   issues: write
 
@@ -56,11 +56,9 @@ jobs:
 
           ASSIGNEE: ${{ github.event_name == 'workflow_dispatch' && inputs.assignee || 'Nicolas-Weber_cvsh' }}
           REVIEWER: ${{ github.event_name == 'workflow_dispatch' && inputs.reviewer || '' }}
-
-          COUNTER_PATH: .release/iteration-seq.json
         run: |
           python3 - <<'PY'
-          import os, re, json, base64
+          import os, re, json
           import urllib.request, urllib.parse
           from datetime import datetime, timedelta, timezone
 
@@ -103,7 +101,6 @@ jobs:
           prefix = os.environ["PREFIX"]
           assignee = (os.environ.get("ASSIGNEE") or "").strip()
           reviewer = (os.environ.get("REVIEWER") or "").strip()
-          counter_path = (os.environ.get("COUNTER_PATH") or ".release/iteration-seq.json").lstrip("/")
 
           if not assignee:
             raise SystemExit("ASSIGNEE is empty. Set it in workflow env/inputs.")
@@ -181,57 +178,7 @@ jobs:
             print(f"PR already exists: #{pr.get('number')} {pr.get('html_url')}")
             raise SystemExit(0)
 
-          # 3) Read nextIterationNumber from base branch (Release-Non-Prod)
-          contents_url = f"{base}/contents/{urllib.parse.quote(counter_path)}?ref={urllib.parse.quote(base_branch)}"
-          status, data = api_request("GET", contents_url)
-          if status != 200:
-            raise SystemExit(f"Failed to read counter file on {base_branch}: HTTP {status} {data}")
-
-          # file_sha_on_base was unused -> removed
-          raw = base64.b64decode(data.get("content", "")).decode("utf-8")
-          obj = json.loads(raw or "{}")
-          current_next = int(obj.get("nextIterationNumber", 1))
-
-          desired_next = latest_n + 1
-          new_next = max(current_next, desired_next)
-
-          print(f"Counter on {base_branch}: nextIterationNumber={current_next}")
-          print(f"Will ensure nextIterationNumber becomes: {new_next} (desired={desired_next})")
-
-          # 4) Commit updated counter file onto the iteration branch (latest_branch)
-          #    (So it is updated only when the PR merges into Release-Non-Prod)
-          contents_url_iter = f"{base}/contents/{urllib.parse.quote(counter_path)}?ref={urllib.parse.quote(latest_branch)}"
-          status, data_iter = api_request("GET", contents_url_iter)
-          if status != 200:
-            raise SystemExit(f"Failed to read counter file on {latest_branch}: HTTP {status} {data_iter}")
-
-          file_sha_on_iter = data_iter.get("sha")
-
-          # Decode current value on the iteration branch to avoid unnecessary commits
-          raw_iter = base64.b64decode(data_iter.get("content", "")).decode("utf-8")
-          obj_iter = json.loads(raw_iter or "{}")
-          iter_next = int(obj_iter.get("nextIterationNumber", 1))
-
-          if iter_next == new_next:
-            print(f"{counter_path} on {latest_branch} already has nextIterationNumber={new_next}. Skipping update.")
-          else:
-            updated_obj = {"nextIterationNumber": new_next}
-            updated_body = json.dumps(updated_obj, indent=2) + "\n"
-            put_payload = {
-              "message": f"chore(release): bump nextIterationNumber to {new_next} [skip ci]",
-              "content": base64.b64encode(updated_body.encode("utf-8")).decode("utf-8"),
-              "branch": latest_branch,
-              "sha": file_sha_on_iter
-            }
-
-            put_url = f"{base}/contents/{urllib.parse.quote(counter_path)}"
-            status, put_resp = api_request("PUT", put_url, put_payload)
-            if status not in (200, 201):
-              raise SystemExit(f"Failed to update counter on {latest_branch}: HTTP {status} {put_resp}")
-
-            print(f"Updated {counter_path} on {latest_branch} to nextIterationNumber={new_next}")
-
-          # 5) Create the PR
+          # 3) Create the PR
           create_pr_url = f"{base}/pulls"
           payload = {
             "title": f"Merge {latest_branch} -> {base_branch}",
@@ -240,8 +187,7 @@ jobs:
             "body": (
               f"Automated PR created by GitHub Actions.\n\n"
               f"Source: `{latest_branch}`\n"
-              f"Target: `{base_branch}`\n\n"
-              f"This PR also bumps `{counter_path}` to `{new_next}` so the next iteration branch can be created."
+              f"Target: `{base_branch}`\n"
             ),
             "maintainer_can_modify": True
           }
@@ -252,14 +198,14 @@ jobs:
           pr_number = pr["number"]
           print(f"Created PR #{pr_number}: {pr.get('html_url')}")
 
-          # 6) Assign a user (assignee)
+          # 4) Assign a user (assignee)
           issue_url = f"{base}/issues/{pr_number}"
           status, resp = api_request("PATCH", issue_url, {"assignees": [assignee]})
           if status not in (200, 201):
             raise SystemExit(f"Failed to assign PR: HTTP {status} {resp}")
           print(f"Assigned PR to: {assignee}")
 
-          # 7) Optionally request a reviewer
+          # 5) Optionally request a reviewer
           if reviewer:
             reviewers_url = f"{base}/pulls/{pr_number}/requested_reviewers"
             status, resp = api_request("POST", reviewers_url, {"reviewers": [reviewer]})
