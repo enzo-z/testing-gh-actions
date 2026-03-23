@@ -1,30 +1,26 @@
-name: Create Pre-Release Iteration Branch (monotonic, biweekly)
+name: Create Pre-Release Iteration Branch (biweekly on Mondays 2am)
 
 on:
   # GitHub Actions cron is evaluated in UTC.
-  # This is Mondays 05:01 UTC (~00:01 EST during standard time).
+  # This is Mondays 7:00 UTC (2:00am EST)
+  # NOTE: This is fixed to EST (no DST adjustment).
   schedule:
-    - cron: "1 5 * * 1"
+    - cron: "0 7 * * 1"
 
   workflow_dispatch:
     inputs:
       base_branch:
         description: "Branch to branch off from"
         required: false
-        default: "main"
+        default: "Release-Non-Prod"
         type: string
       prefix:
         description: "Prefix for iteration branches"
         required: false
         default: "Pre-Release-Iteration-"
         type: string
-      counter_path:
-        description: "Path to counter file in repo"
-        required: false
-        default: ".release/iteration-seq.json"
-        type: string
       iteration_number:
-        description: "Optional: override the iteration number to create (manual runs only). Example: 12 creates Pre-Release-Iteration-12 and sets nextIterationNumber to 13."
+        description: "Optional: override the iteration number to create (manual runs only). Example: 12 creates Pre-Release-Iteration-12."
         required: false
         default: ""
         type: string
@@ -42,24 +38,25 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Create next iteration branch using repo counter
+      - name: Create next iteration branch using repo variable
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
           API_URL: ${{ github.api_url }}
           REPO: ${{ github.repository }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
 
-          # schedule runs have no inputs, so guard with event_name
-          BASE_BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.base_branch || 'main' }}
+          # schedule runs have no inputs, so guard with event name
+          BASE_BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.base_branch || 'Release-Non-Prod' }}
           PREFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.prefix || 'Pre-Release-Iteration-' }}
-          COUNTER_PATH: ${{ github.event_name == 'workflow_dispatch' && inputs.counter_path || '.release/iteration-seq.json' }}
 
           # Manual-only override (empty string means "no override")
           ITERATION_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.iteration_number || '' }}
 
+          VARIABLE_NAME: NEXT_ITERATION_NUMBER
+
         run: |
           python3 - <<'PY'
-          import os, json, base64, urllib.request, urllib.parse, re
+          import os, json, urllib.request, urllib.parse, urllib.error, re
           from datetime import datetime, timedelta, timezone
 
           # ----------------------------
@@ -68,21 +65,21 @@ jobs:
           event_name = os.environ.get("GITHUB_EVENT_NAME", "")
 
           if event_name == "schedule":
-            # Anchor: Monday 2026-01-26 (UTC week bucket)
-            ANCHOR = datetime(2026, 1, 26, 0, 0, tzinfo=timezone.utc)
-            now = datetime.now(timezone.utc)
+              # Anchor: Monday 2026-01-26 (UTC week bucket)
+              ANCHOR = datetime(2026, 1, 26, 0, 0, tzinfo=timezone.utc)
+              now = datetime.now(timezone.utc)
 
-            # Week bucket starts Monday 00:00 UTC (robust if the run is delayed)
-            this_monday = (now - timedelta(days=now.weekday())).replace(
-              hour=0, minute=0, second=0, microsecond=0
-            )
-            weeks_since_anchor = (this_monday - ANCHOR).days // 7
+              # Week bucket starts Monday 00:00 UTC (robust if run is delayed)
+              this_monday = (now - timedelta(days=now.weekday())).replace(
+                  hour=0, minute=0, second=0, microsecond=0
+              )
+              weeks_since_anchor = (this_monday - ANCHOR).days // 7
 
-            if weeks_since_anchor % 2 != 0:
-              print(f"Off-week (weeks_since_anchor={weeks_since_anchor}). Exiting.")
-              raise SystemExit(0)
+              if weeks_since_anchor % 2 != 0:
+                  print(f"Off-week (weeks_since_anchor={weeks_since_anchor}). Exiting.")
+                  raise SystemExit(0)
           else:
-            print(f"Non-schedule run ({event_name}); bypassing biweekly gate.")
+              print(f"Non-schedule run ({event_name}); bypassing biweekly gate.")
 
           # ----------------------------
           # Main logic
@@ -92,110 +89,122 @@ jobs:
           repo = os.environ["REPO"]
           base_branch = os.environ["BASE_BRANCH"]
           prefix = os.environ["PREFIX"]
-          counter_path = os.environ["COUNTER_PATH"].lstrip("/")
           override_raw = (os.environ.get("ITERATION_OVERRIDE") or "").strip()
+          variable_name = os.environ["VARIABLE_NAME"]
 
           owner, name = repo.split("/", 1)
           base = f"{api_url}/repos/{owner}/{name}"
 
           def api_request(method, url, payload=None):
-            data = None
-            headers = {
-              "Accept": "application/vnd.github+json",
-              "Authorization": f"Bearer {token}",
-              "X-GitHub-Api-Version": "2022-11-28",
-              "User-Agent": "iteration-branch-monotonic"
-            }
-            if payload is not None:
-              data = json.dumps(payload).encode("utf-8")
-              headers["Content-Type"] = "application/json"
-            req = urllib.request.Request(url, data=data, headers=headers, method=method)
-            try:
-              with urllib.request.urlopen(req) as resp:
-                body = resp.read().decode("utf-8")
-                return resp.status, json.loads(body) if body else None
-            except urllib.error.HTTPError as e:
-              body = e.read().decode("utf-8") if e.fp else ""
+              data = None
+              headers = {
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {token}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "iteration-branch-monotonic"
+              }
+              if payload is not None:
+                  data = json.dumps(payload).encode("utf-8")
+                  headers["Content-Type"] = "application/json"
+
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
               try:
-                parsed = json.loads(body) if body else {"message": str(e)}
-              except Exception:
-                parsed = {"message": body or str(e)}
-              return e.code, parsed
+                  with urllib.request.urlopen(req) as resp:
+                      body = resp.read().decode("utf-8")
+                      return resp.status, json.loads(body) if body else None
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode("utf-8") if e.fp else ""
+                  try:
+                      parsed = json.loads(body) if body else {"message": str(e)}
+                  except Exception:
+                      parsed = {"message": body or str(e)}
+                  return e.code, parsed
 
           def get_head_sha(branch):
-            enc = urllib.parse.quote(branch, safe="")
-            url = f"{base}/git/ref/heads/{enc}"
-            status, data = api_request("GET", url)
-            if status != 200:
-              raise SystemExit(f"Failed to read base branch '{branch}': HTTP {status} {data}")
-            return data["object"]["sha"]
-
-          def get_or_init_counter():
-            # GET /contents/{path}?ref={base_branch}
-            url = f"{base}/contents/{urllib.parse.quote(counter_path)}?ref={urllib.parse.quote(base_branch)}"
-            status, data = api_request("GET", url)
-
-            if status == 200:
-              content_b64 = data.get("content", "")
-              sha = data.get("sha")
-              raw = base64.b64decode(content_b64).decode("utf-8")
-              obj = json.loads(raw)
-
-              # nextIterationNumber means "the next number to create"
-              nxt = int(obj.get("nextIterationNumber", 1))
-              return nxt, sha
-
-            if status == 404:
-              # Initialize counter file with nextIterationNumber=1
-              return 1, None
-
-            raise SystemExit(f"Failed to read counter file: HTTP {status} {data}")
-
-          def write_counter(next_value, existing_sha):
-            message = f"chore(release): set nextIterationNumber to {next_value} [skip ci]"
-            body = json.dumps({"nextIterationNumber": next_value}, indent=2) + "\n"
-            payload = {
-              "message": message,
-              "content": base64.b64encode(body.encode("utf-8")).decode("utf-8"),
-              "branch": base_branch
-            }
-            if existing_sha:
-              payload["sha"] = existing_sha
-
-            url = f"{base}/contents/{urllib.parse.quote(counter_path)}"
-            status, data = api_request("PUT", url, payload)
-            if status not in (200, 201):
-              raise SystemExit(f"Failed to write counter file: HTTP {status} {data}")
-            return data
+              enc = urllib.parse.quote(branch, safe="")
+              url = f"{base}/git/ref/heads/{enc}"
+              status, data = api_request("GET", url)
+              if status != 200:
+                  raise SystemExit(f"Failed to read base branch '{branch}': HTTP {status} {data}")
+              return data["object"]["sha"]
 
           def parse_override(value: str):
-            if not value:
-              return None
-            if not re.fullmatch(r"\d+", value):
-              raise SystemExit(f"iteration_number must be a positive integer, got: '{value}'")
-            n = int(value)
-            if n <= 0:
-              raise SystemExit(f"iteration_number must be >= 1, got: {n}")
-            return n
+              if not value:
+                  return None
+              if not re.fullmatch(r"\d+", value):
+                  raise SystemExit(f"iteration_number must be a positive integer, got: '{value}'")
+              n = int(value)
+              if n <= 0:
+                  raise SystemExit(f"iteration_number must be >= 1, got: {n}")
+              return n
+
+          def get_or_init_repo_variable():
+              get_url = f"{base}/actions/variables/{urllib.parse.quote(variable_name, safe='')}"
+              status, data = api_request("GET", get_url)
+
+              if status == 200:
+                  raw = (data.get("value") or "").strip()
+                  if not re.fullmatch(r"\d+", raw):
+                      raise SystemExit(
+                          f"Repository variable {variable_name} must contain a positive integer. Current value: '{raw}'"
+                      )
+                  n = int(raw)
+                  if n <= 0:
+                      raise SystemExit(
+                          f"Repository variable {variable_name} must be >= 1. Current value: {n}"
+                      )
+                  return n
+
+              if status == 404:
+                  print(f"Repository variable {variable_name} does not exist. Initializing with value 1.")
+                  create_url = f"{base}/actions/variables"
+                  status2, data2 = api_request(
+                      "POST",
+                      create_url,
+                      {
+                          "name": variable_name,
+                          "value": "1"
+                      }
+                  )
+                  if status2 != 201:
+                      raise SystemExit(f"Failed to create repo variable: HTTP {status2} {data2}")
+                  return 1
+
+              raise SystemExit(f"Failed to read repo variable: HTTP {status} {data}")
+
+          def set_repo_variable(value: int):
+              get_url = f"{base}/actions/variables/{urllib.parse.quote(variable_name, safe='')}"
+              status, data = api_request(
+                  "PATCH",
+                  get_url,
+                  {
+                      "name": variable_name,
+                      "value": str(value)
+                  }
+              )
+              if status != 204:
+                  raise SystemExit(f"Failed to update repo variable: HTTP {status} {data}")
 
           override_n = parse_override(override_raw)
 
           # 1) Determine iteration number to create
-          file_next, counter_sha = get_or_init_counter()
+          repo_next = get_or_init_repo_variable()
 
           if override_n is not None:
-            next_n = override_n
-            print(f"Manual override provided. Will create iteration: {next_n}")
+              next_n = override_n
+              print(f"Manual override provided. Will create iteration: {next_n}")
           else:
-            next_n = file_next
-            print(f"No override provided. Using counter file nextIterationNumber: {next_n}")
+              next_n = repo_next
+              print(f"No override provided. Using repository variable {variable_name}: {next_n}")
 
           new_branch = f"{prefix}{next_n}"
 
-          # Optional sanity: warn if override is behind file value
-          if override_n is not None and override_n < file_next:
-            print(f"WARNING: override ({override_n}) is less than file nextIterationNumber ({file_next}). "
-                  f"This may create a duplicate/older iteration number if it already exists.")
+          # Optional sanity warning
+          if override_n is not None and override_n < repo_next:
+              print(
+                  f"WARNING: override ({override_n}) is less than repository variable "
+                  f"{variable_name} ({repo_next}). This may create an older/duplicate branch."
+              )
 
           print(f"Creating iteration branch: {new_branch}")
 
@@ -206,17 +215,16 @@ jobs:
           status, resp = api_request("POST", create_ref_url, payload)
 
           if status == 422:
-            # If branch already exists, do NOT update counter; just stop.
-            print(f"Branch already exists or invalid (422): {resp}")
-            raise SystemExit(0)
+              print(f"Branch already exists or invalid (422): {resp}")
+              raise SystemExit(0)
+
           if status not in (200, 201):
-            raise SystemExit(f"Failed to create branch: HTTP {status} {resp}")
+              raise SystemExit(f"Failed to create branch: HTTP {status} {resp}")
 
           print(f"Created branch: {new_branch}")
 
-          # 3) Update the counter so the next auto run creates the following number
-          # If we created N, we set nextIterationNumber = N+1
-          new_next = next_n + 1
-          write_counter(new_next, counter_sha)
-          print(f"Counter updated to nextIterationNumber={new_next} in {counter_path}")
+          # 3) Advance NEXT_ITERATION_NUMBER
+          next_repo_value = next_n + 1
+          set_repo_variable(next_repo_value)
+          print(f"Updated {variable_name} to {next_repo_value}")
           PY
